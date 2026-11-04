@@ -21,11 +21,18 @@ class DouyinParser
     /** 桌面端 UA：短链重定向解析、HEAD 探测、原画 302 跟随 */
     private const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
-    /** 原画播放地址模板：传入 vid 拼接后 302 即为原画直链（与 workers 版一致） */
-    private const ORIGINAL_PLAY_ENDPOINT = 'https://aweme.snssdk.com/aweme/v1/play/';
+    /**
+     * 原画播放地址模板：传入 vid 拼接后 302 即为原画直链。
+     * 使用 improve_bitrate=1，抖音会把部分作品的 302 目标切到
+     * tos-cn-v-* 原始源对象（未走 ve-15 转码链）。
+     */
+    private const ORIGINAL_PLAY_ENDPOINT = 'https://www.douyin.com/aweme/v1/play/';
 
     /** 批量转换 vid 的单次上限（与 workers 版一致，超出的 vid 回退拼接地址） */
     private const VID_RESOLVE_MAX_COUNT = 30;
+
+    /** 每个视频最多探测体积的档位数量，避免解析接口过慢 */
+    private const VARIANT_PROBE_LIMIT = 6;
 
     /** 详情接口超时秒数 */
     private const REQUEST_TIMEOUT = 20;
@@ -247,6 +254,7 @@ class DouyinParser
             'create_time' => $createTime,
             'publish_time' => $this->formatPublishTime($createTime),
             'video_backup' => [],
+            'video_variants' => [],
             'images' => [],
             'live_photo' => [],
             'music' => [
@@ -314,18 +322,9 @@ class DouyinParser
                 $main = $this->toHttps(str_replace('playwm', 'play', $main));
             }
 
-            // 原画优先：拿 vid 302 后的原画直链作为主地址；失败则回退原来的 main
-            $resolvedOriginal = $this->resolveOriginalVideoUrl($playUri);
-            if ($resolvedOriginal) {
-                if ($main && $main !== $resolvedOriginal) {
-                    array_unshift($videoInfo['backup'], $main);
-                }
-                $main = $resolvedOriginal;
-                // 只要主链接是原画 302 出来的，画质统一标 original
-                $result['quality'] = 'original';
-            } elseif ($videoInfo['gearName'] !== '') {
-                $result['quality'] = $videoInfo['gearName'];
-            }
+            // 主地址已经在 extractHighestQualityVideo 里按
+            // “真实分辨率 → 同分辨率体积 → 原画优先” 选好，这里只负责输出标签
+            $result['quality'] = $videoInfo['label'] ?: $videoInfo['gearName'];
 
             // 补齐抖音 CDN 约定参数 mime_type=video_mp4；主地址先归一，保证下面去重比较口径一致
             $main = $this->ensureVideoMimeType($main);
@@ -340,10 +339,15 @@ class DouyinParser
 
             $result['url'] = $main;
             if ($main) {
-                $result['size'] = $this->probeVideoSize($main);
+                // 最佳档位的体积已经探测过，避免重复 HEAD
+                $result['size'] = (int)($videoInfo['size'] ?? 0);
+                if ($result['size'] <= 0) {
+                    $result['size'] = $this->probeVideoSize($main);
+                }
                 $result['size_label'] = $this->formatSizeLabel($result['size']);
             }
             $result['video_backup'] = $backups;
+            $result['video_variants'] = $videoInfo['variants'] ?? [];
             $result['video_id'] = $playUri ?: $fallbackVideoId;
         }
 
@@ -471,81 +475,17 @@ class DouyinParser
     }
 
     /**
-     * 提取最高画质视频：bitRateList/bit_rate 按 bitRate 降序，v3-web 优先，v26-web 换域名，其余进备用
+     * 提取最高画质视频：合并 bit_rate 全量档位 + vid 302 原画直链，
+     * 按“真实分辨率优先、同分辨率体积优先”排序，返回主地址、备选和完整档位。
      */
     private function extractHighestQualityVideo($detail)
     {
         $video = is_array($detail['video'] ?? null) ? $detail['video'] : [];
-        $bitRateList = null;
+        $variants = $this->collectVideoVariants($video);
 
-        if (!empty($video['bitRateList']) && is_array($video['bitRateList'])) {
-            $bitRateList = $video['bitRateList'];
-        } elseif (!empty($video['bit_rate']) && is_array($video['bit_rate'])) {
-            $bitRateList = $video['bit_rate'];
-        }
-
-        $url = null;
-        $gearName = '';
-        $backup = [];
-
-        if ($bitRateList) {
-            usort($bitRateList, function ($a, $b) {
-                $ba = is_array($a) ? (float)($a['bitRate'] ?? $a['bit_rate'] ?? 0) : 0;
-                $bb = is_array($b) ? (float)($b['bitRate'] ?? $b['bit_rate'] ?? 0) : 0;
-                return $bb <=> $ba;
-            });
-
-            foreach ($bitRateList as $rateItem) {
-                if (!is_array($rateItem)) {
-                    continue;
-                }
-
-                $candidates = $this->collectPlayUrlCandidates($rateItem);
-                if (!$candidates) {
-                    continue;
-                }
-
-                $v3Link = null;
-                $v26Link = null;
-                foreach ($candidates as $candidate) {
-                    if (strpos($candidate, 'v3-web') !== false) {
-                        $v3Link = $candidate;
-                        break;
-                    }
-                    if ($v26Link === null && strpos($candidate, 'v26-web') !== false) {
-                        $v26Link = $candidate;
-                    }
-                }
-
-                $currentBestUrl = $v3Link ?: ($v26Link ? $this->replacePlayHost($v26Link) : $candidates[0]);
-
-                if (!$url) {
-                    $url = $currentBestUrl;
-                    $gearName = $this->strv($rateItem['gearName'] ?? $rateItem['gear_name'] ?? '');
-                }
-
-                foreach ($candidates as $candidate) {
-                    if (strpos($candidate, 'v26-web') !== false) {
-                        $candidate = $this->replacePlayHost($candidate);
-                    }
-                    if ($candidate !== $url && !in_array($candidate, $backup, true)) {
-                        $backup[] = $candidate;
-                    }
-                }
-
-                if ($url && $backup) {
-                    break;
-                }
-            }
-        }
-
-        // 码率列表缺失时的兜底：playApi → 原画拼接地址
-        if (!$url) {
-            $uri = isset($video['uri']) && is_string($video['uri']) ? $video['uri'] : '';
-            if ($uri === '' && isset($video['play_addr']['uri'])) {
-                $uri = (string)$video['play_addr']['uri'];
-            }
-
+        if (!$variants) {
+            // 极端兜底：没有任何 bit_rate 档位时，沿用 play_addr / playApi
+            $uri = $this->extractVidFromVideoInfo($video);
             $playApi = '';
             if (isset($video['playApi']) && is_string($video['playApi']) && $video['playApi'] !== '') {
                 $playApi = $video['playApi'];
@@ -553,28 +493,483 @@ class DouyinParser
                 $playApi = $video['play_addr']['url_list'][0];
             }
 
+            $url = null;
             if ($playApi !== '') {
                 $url = str_replace('playwm', 'play', $playApi);
-            } elseif ($uri !== '') {
-                // 原画兜底地址：formatData 会用 vid 走 resolveOriginalVideoUrl 做 302 解析，失败回退此地址
+            } elseif ($uri) {
                 $url = $this->buildOriginalPlayUrl($uri);
             }
+            $url = $url ? $this->toHttps(str_replace('playwm', 'play', $url)) : null;
 
-            $urlList = is_array($video['play_addr']['url_list'] ?? null) ? $video['play_addr']['url_list'] : [];
-            if (count($urlList) > 1) {
-                foreach ($urlList as $index => $link) {
-                    if ($index === 0 || !is_string($link) || $link === '') {
-                        continue;
-                    }
-                    $converted = str_replace('playwm', 'play', $link);
-                    if ($converted && $converted !== $url && !in_array($converted, $backup, true)) {
-                        $backup[] = $converted;
-                    }
-                }
+            return [
+                'url' => $url,
+                'backup' => [],
+                'gearName' => '',
+                'variants' => [],
+                'is_original' => $this->isOriginalSourceUrl($url),
+                'label' => $this->variantLabel([
+                    'is_original' => $this->isOriginalSourceUrl($url),
+                    'width' => 0,
+                    'height' => 0,
+                    'gear_name' => '',
+                    'bit_rate' => 0,
+                ]),
+                'size' => 0,
+            ];
+        }
+
+        // 先按分辨率/码率/原画标记预排序，再只探测前 N 个体积，最后按真实体积复排
+        $this->sortVideoVariants($variants);
+        $this->probeVariantSizes($variants, self::VARIANT_PROBE_LIMIT);
+        $this->sortVideoVariants($variants);
+        $this->dedupeVideoVariants($variants);
+        $this->sortVideoVariants($variants);
+
+        $best = $variants[0];
+        $backup = [];
+        $variantOutput = [];
+
+        foreach ($variants as $index => $variant) {
+            $url = $this->ensureVideoMimeType($variant['url']);
+            if ($index > 0 && $url !== '' && !in_array($url, $backup, true)) {
+                $backup[] = $url;
             }
         }
 
-        return ['url' => $url, 'backup' => $backup, 'gearName' => $gearName];
+        foreach ($variants as $variant) {
+            $variantOutput[] = $this->formatVariantOutput($variant);
+        }
+
+        return [
+            'url' => $this->ensureVideoMimeType($best['url']),
+            'backup' => $backup,
+            'gearName' => $this->strv($best['gear_name'] ?? ''),
+            'variants' => $variantOutput,
+            'is_original' => !empty($best['is_original']),
+            'label' => $this->variantLabel($best),
+            'size' => (int)($best['size'] ?? 0),
+        ];
+    }
+
+    /**
+     * 汇总视频所有可用档位：
+     * 1) video.bit_rate / bitRateList 的每一档（含 H.264 / HEVC、540p~4K）
+     * 2) vid 走 improve_bitrate=1 的 302 结果（可能是 tos-cn-v-* 原始源对象）
+     */
+    private function collectVideoVariants($video)
+    {
+        $variants = [];
+        $seen = [];
+
+        $bitRateList = [];
+        if (!empty($video['bitRateList']) && is_array($video['bitRateList'])) {
+            $bitRateList = $video['bitRateList'];
+        } elseif (!empty($video['bit_rate']) && is_array($video['bit_rate'])) {
+            $bitRateList = $video['bit_rate'];
+        }
+
+        foreach ($bitRateList as $rateItem) {
+            if (!is_array($rateItem)) {
+                continue;
+            }
+
+            $candidates = $this->collectPlayUrlCandidates($rateItem);
+            if (!$candidates) {
+                continue;
+            }
+
+            $url = $this->pickBestPlayCandidate($candidates);
+            if (!$url) {
+                continue;
+            }
+            $url = $this->toHttps(str_replace('playwm', 'play', $url));
+
+            $key = $this->variantKey($url);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+
+            $playAddr = is_array($rateItem['play_addr'] ?? null) ? $rateItem['play_addr'] : [];
+            $variants[] = [
+                'url' => $url,
+                'width' => (int)($playAddr['width'] ?? $rateItem['width'] ?? 0),
+                'height' => (int)($playAddr['height'] ?? $rateItem['height'] ?? 0),
+                'bit_rate' => (int)($rateItem['bitRate'] ?? $rateItem['bit_rate'] ?? 0),
+                'quality_type' => (int)($rateItem['quality_type'] ?? 0),
+                'gear_name' => $this->strv($rateItem['gearName'] ?? $rateItem['gear_name'] ?? ''),
+                'codec' => (!empty($rateItem['is_h265']) || !empty($rateItem['is_bytevc1'])) ? 'h265' : 'h264',
+                'format' => $this->strv($rateItem['format'] ?? 'mp4'),
+                'is_original' => $this->isOriginalSourceUrl($url),
+                'source' => 'bit_rate',
+                'size' => 0,
+                'size_label' => '',
+            ];
+        }
+
+        // vid 302：可能落到 tos-cn-v-* 原始源对象，也可能是和 bit_rate 相同的转码对象
+        $vid = $this->extractVidFromVideoInfo($video);
+        $resolved = $this->resolveOriginalVideoUrl($vid);
+        if ($resolved) {
+            $url = $this->toHttps(str_replace('playwm', 'play', $resolved));
+            $key = $this->variantKey($url);
+            $isOriginal = $this->isOriginalSourceUrl($url);
+
+            if (isset($seen[$key])) {
+                foreach ($variants as &$variant) {
+                    if ($this->variantKey($variant['url']) === $key) {
+                        if ($isOriginal) {
+                            $variant['is_original'] = true;
+                            $variant['quality_type'] = 64;
+                            $variant['gear_name'] = 'original';
+                        }
+                        break;
+                    }
+                }
+                unset($variant);
+            } else {
+                $seen[$key] = true;
+                $variants[] = [
+                    'url' => $url,
+                    'width' => (int)($video['play_addr']['width'] ?? $video['width'] ?? 0),
+                    'height' => (int)($video['play_addr']['height'] ?? $video['height'] ?? 0),
+                    'bit_rate' => 0,
+                    'quality_type' => $isOriginal ? 64 : 0,
+                    'gear_name' => $isOriginal ? 'original' : '',
+                    'codec' => (!empty($video['is_h265']) || !empty($video['is_bytevc1'])) ? 'h265' : 'h264',
+                    'format' => 'mp4',
+                    'is_original' => $isOriginal,
+                    'source' => 'play_302',
+                    'size' => 0,
+                    'size_label' => '',
+                ];
+            }
+        }
+
+        return $variants;
+    }
+
+    /**
+     * 从一档的多个候选地址里挑最稳的一个：v3-web 优先，v26-web 换域名，否则第一个
+     */
+    private function pickBestPlayCandidate($candidates)
+    {
+        $v3Link = null;
+        $v26Link = null;
+
+        foreach ($candidates as $candidate) {
+            if (!is_string($candidate) || $candidate === '') {
+                continue;
+            }
+            if ($v3Link === null && strpos($candidate, 'v3-web') !== false) {
+                $v3Link = $candidate;
+            }
+            if ($v26Link === null && strpos($candidate, 'v26-web') !== false) {
+                $v26Link = $candidate;
+            }
+        }
+
+        if ($v3Link !== null) {
+            return $v3Link;
+        }
+        if ($v26Link !== null) {
+            return $this->replacePlayHost($v26Link);
+        }
+        return $candidates[0];
+    }
+
+    /**
+     * 同一对象的去重 key：忽略 CDN 域名和签名，只保留 tos bucket + object id
+     */
+    private function variantKey($url)
+    {
+        if (is_string($url) && preg_match('~/video/tos/cn/([^/?]+/[^/?]+)~', $url, $matches)) {
+            return $matches[1];
+        }
+        return is_string($url) ? $url : '';
+    }
+
+    /**
+     * 是否抖音原始源对象（tos-cn-v-*）；tos-cn-ve-* / tos-cn-vd-* 都是转码/分发对象
+     */
+    private function isOriginalSourceUrl($url)
+    {
+        return is_string($url) && strpos($url, '/tos-cn-v-') !== false;
+    }
+
+    /**
+     * 画质标签：优先标 original，其次按短边归一到 540p/720p/1080p/1440p/2160p
+     */
+    private function variantLabel($variant)
+    {
+        if (!empty($variant['is_original'])) {
+            return 'original';
+        }
+
+        $label = $this->resolutionLabel($variant['width'] ?? 0, $variant['height'] ?? 0);
+        if ($label !== '') {
+            return $label;
+        }
+
+        $gear = $this->strv($variant['gear_name'] ?? '');
+        if ($gear !== '') {
+            return $gear;
+        }
+
+        $bitRate = (int)($variant['bit_rate'] ?? 0);
+        return $bitRate > 0 ? (string)round($bitRate / 1000) . 'kbps' : '';
+    }
+
+    /**
+     * 分辨率短边 → 常见画质档位标签
+     */
+    private function resolutionLabel($width, $height)
+    {
+        $width = (int)$width;
+        $height = (int)$height;
+        if ($width <= 0 || $height <= 0) {
+            return '';
+        }
+
+        $short = min($width, $height);
+        if ($short >= 2000) {
+            return '2160p';
+        }
+        if ($short >= 1400) {
+            return '1440p';
+        }
+        if ($short >= 1000) {
+            return '1080p';
+        }
+        if ($short >= 700) {
+            return '720p';
+        }
+        if ($short >= 500) {
+            return '540p';
+        }
+        return $short . 'p';
+    }
+
+    /**
+     * 档位排序：真实分辨率降序 → 同分辨率体积降序 → 原画优先 → 码率降序
+     */
+    private function sortVideoVariants(&$variants)
+    {
+        usort($variants, function ($a, $b) {
+            $pa = (int)($a['width'] ?? 0) * (int)($a['height'] ?? 0);
+            $pb = (int)($b['width'] ?? 0) * (int)($b['height'] ?? 0);
+            if ($pa !== $pb) {
+                return $pb <=> $pa;
+            }
+
+            $sa = (int)($a['size'] ?? 0);
+            $sb = (int)($b['size'] ?? 0);
+            if ($sa > 0 || $sb > 0) {
+                if ($sa !== $sb) {
+                    return $sb <=> $sa;
+                }
+            }
+
+            $oa = !empty($a['is_original']);
+            $ob = !empty($b['is_original']);
+            if ($oa !== $ob) {
+                return $oa ? -1 : 1;
+            }
+
+            return (int)($b['bit_rate'] ?? 0) <=> (int)($a['bit_rate'] ?? 0);
+        });
+    }
+
+    /**
+     * 同分辨率只保留最优档位：体积最大者优先；体积未知时原画优先，其次码率
+     */
+    private function dedupeVideoVariants(&$variants)
+    {
+        $byResolution = [];
+
+        foreach ($variants as $variant) {
+            $width = (int)($variant['width'] ?? 0);
+            $height = (int)($variant['height'] ?? 0);
+            $label = $this->resolutionLabel($width, $height);
+            $key = $label !== ''
+                ? $label
+                : ($this->strv($variant['gear_name'] ?? '') ?: $this->variantKey($variant['url']));
+
+            if (!isset($byResolution[$key])) {
+                $byResolution[$key] = $variant;
+                continue;
+            }
+
+            if ($this->isBetterVariant($variant, $byResolution[$key])) {
+                $byResolution[$key] = $variant;
+            }
+        }
+
+        $variants = array_values($byResolution);
+    }
+
+    /**
+     * 两个同分辨率档位谁更优
+     */
+    private function isBetterVariant($a, $b)
+    {
+        $sa = (int)($a['size'] ?? 0);
+        $sb = (int)($b['size'] ?? 0);
+        if ($sa > 0 || $sb > 0) {
+            if ($sa !== $sb) {
+                return $sa > $sb;
+            }
+        }
+
+        $oa = !empty($a['is_original']);
+        $ob = !empty($b['is_original']);
+        if ($oa !== $ob) {
+            return $oa;
+        }
+
+        return (int)($a['bit_rate'] ?? 0) > (int)($b['bit_rate'] ?? 0);
+    }
+
+    /**
+     * 选择要探测体积的档位：原画必测，其余每个画质档位取码率最高的一条
+     */
+    private function selectProbeCandidates($variants, $limit = 6)
+    {
+        $indices = [];
+        $tierCandidates = [];
+
+        foreach ($variants as $index => $variant) {
+            if (!empty($variant['is_original'])) {
+                if (!in_array($index, $indices, true)) {
+                    $indices[] = $index;
+                }
+                continue;
+            }
+
+            $label = $this->resolutionLabel($variant['width'] ?? 0, $variant['height'] ?? 0);
+            $key = $label !== ''
+                ? $label
+                : ($this->strv($variant['gear_name'] ?? '') ?: $this->variantKey($variant['url']));
+
+            if (!isset($tierCandidates[$key])) {
+                $tierCandidates[$key] = $index;
+                continue;
+            }
+
+            $current = $variants[$tierCandidates[$key]];
+            if ((int)($variant['bit_rate'] ?? 0) > (int)($current['bit_rate'] ?? 0)) {
+                $tierCandidates[$key] = $index;
+            }
+        }
+
+        $ordered = [];
+        foreach ($tierCandidates as $index) {
+            $variant = $variants[$index];
+            $ordered[] = [
+                'index' => $index,
+                'pixels' => (int)($variant['width'] ?? 0) * (int)($variant['height'] ?? 0),
+            ];
+        }
+        usort($ordered, function ($a, $b) {
+            return $b['pixels'] <=> $a['pixels'];
+        });
+
+        foreach ($ordered as $item) {
+            if (!in_array($item['index'], $indices, true)) {
+                $indices[] = $item['index'];
+            }
+            if (count($indices) >= $limit) {
+                break;
+            }
+        }
+
+        return $indices;
+    }
+
+    /**
+     * 并发探测前 N 个档位的真实字节数（HEAD，不下载正文）
+     */
+    private function probeVariantSizes(&$variants, $limit = 6)
+    {
+        $indices = $this->selectProbeCandidates($variants, $limit);
+        if (!$indices) {
+            return;
+        }
+
+        $mh = curl_multi_init();
+        $handles = [];
+
+        foreach ($indices as $i) {
+            $ch = curl_init($variants[$i]['url']);
+            curl_setopt_array($ch, [
+                CURLOPT_USERAGENT => self::DESKTOP_UA,
+                CURLOPT_NOBODY => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 5,
+                CURLOPT_CONNECTTIMEOUT => 3,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => false,
+                CURLOPT_HTTPHEADER => ['Referer: https://www.douyin.com/'],
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$i] = $ch;
+        }
+
+        $running = null;
+        do {
+            $status = curl_multi_exec($mh, $running);
+            if ($running) {
+                curl_multi_select($mh, 0.5);
+            }
+        } while ($running > 0 && $status === CURLM_OK);
+
+        foreach ($handles as $i => $ch) {
+            $error = curl_error($ch);
+            $contentType = strtolower((string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE));
+            $length = (int)curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T);
+            $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+            if (
+                !$error &&
+                $httpCode >= 200 &&
+                $httpCode < 300 &&
+                $length > 0 &&
+                (strpos($contentType, 'video') !== false || strpos($contentType, 'octet-stream') !== false)
+            ) {
+                $variants[$i]['size'] = $length;
+                $variants[$i]['size_label'] = $this->formatSizeLabel($length);
+            }
+
+            curl_multi_remove_handle($mh, $ch);
+        }
+
+        curl_multi_close($mh);
+    }
+
+    /**
+     * 单个档位转成统一 JSON 契约里的对象
+     */
+    private function formatVariantOutput($variant)
+    {
+        $label = $this->variantLabel($variant);
+
+        return [
+            'label' => $label,
+            'quality' => $label,
+            'url' => $this->strv($variant['url'] ?? ''),
+            'bit_rate' => (int)($variant['bit_rate'] ?? 0),
+            'width' => (int)($variant['width'] ?? 0),
+            'height' => (int)($variant['height'] ?? 0),
+            'format' => $this->strv($variant['format'] ?? 'mp4'),
+            'codec' => $this->strv($variant['codec'] ?? ''),
+            'quality_type' => (int)($variant['quality_type'] ?? 0),
+            'gear_name' => $this->strv($variant['gear_name'] ?? ''),
+            'size' => (int)($variant['size'] ?? 0),
+            'size_label' => $this->strv($variant['size_label'] ?? ''),
+            'is_original' => !empty($variant['is_original']),
+            'source' => $this->strv($variant['source'] ?? ''),
+        ];
     }
 
     /**
@@ -653,13 +1048,27 @@ class DouyinParser
 
     /**
      * 拼接原画播放地址（唯一原画接口）
+     *
+     * improve_bitrate=1 是关键参数：普通 ratio=default 通常只给转码流，
+     * 带上它后部分作品会 302 到 tos-cn-v-* 的原始源对象。
      */
     private function buildOriginalPlayUrl($vid, $ratio = 'default')
     {
         if (empty($vid)) {
             return null;
         }
-        return self::ORIGINAL_PLAY_ENDPOINT . '?video_id=' . rawurlencode((string)$vid) . '&ratio=' . $ratio . '&line=0';
+
+        return self::ORIGINAL_PLAY_ENDPOINT . '?' . http_build_query([
+            'video_id' => (string)$vid,
+            'line' => '0',
+            'ratio' => $ratio,
+            'watermark' => '0',
+            'media_type' => '4',
+            'vr_type' => '0',
+            'improve_bitrate' => '1',
+            'is_play_url' => '1',
+            'source' => 'PackSourceEnum_AWEME_DETAIL',
+        ]);
     }
 
     /**

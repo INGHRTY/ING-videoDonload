@@ -102,7 +102,7 @@ These 16 base fields are the fixed structure of a successful media object. `size
 
 ## 1. Video type
 
-`url` is the main video address; `images` and `live_photo` are `[]`. If alternative videos exist, an optional `video_backup` array may be returned.
+`url` is the main video address; `images` and `live_photo` are `[]`. If alternative videos exist, an optional `video_backup` (legacy string array) and `video_variants` (full variant objects) may be returned. The main address is chosen by: **real resolution first → larger file size at the same resolution → original source first → higher bit rate**.
 
 ```json
 {
@@ -128,19 +128,25 @@ These 16 base fields are the fixed structure of a successful media object. `size
     "images": [],
     "live_photo": [],
     "video_backup": [
+      "https://example.com/video_720p.mp4",
+      "https://example.com/video_540p.mp4"
+    ],
+    "video_variants": [
       {
-        "label": "1080p",
-        "quality": "1080p",
-        "url": "https://example.com/video_1080p.mp4",
-        "bit_rate": 2500000,
+        "label": "original",
+        "quality": "original",
+        "url": "https://example.com/video_original.mp4",
+        "bit_rate": 0,
         "width": 1920,
         "height": 1080,
         "format": "mp4",
-        "codec": "h265",
-        "quality_type": 8,
-        "gear_name": "Standard",
-        "size": 10485760,
-        "size_label": "10.00MB"
+        "codec": "h264",
+        "quality_type": 64,
+        "gear_name": "original",
+        "size": 104857600,
+        "size_label": "100MB",
+        "is_original": true,
+        "source": "play_302"
       },
       {
         "label": "720p",
@@ -152,9 +158,11 @@ These 16 base fields are the fixed structure of a successful media object. `size
         "format": "mp4",
         "codec": "h264",
         "quality_type": 4,
-        "gear_name": "Smooth",
+        "gear_name": "normal_720_0",
         "size": 5242880,
-        "size_label": "5.00MB"
+        "size_label": "5.00MB",
+        "is_original": false,
+        "source": "bit_rate"
       }
     ],
     "music": {
@@ -178,16 +186,18 @@ These 16 base fields are the fixed structure of a successful media object. `size
 }
 ```
 
-### video_backup
+### video_backup and video_variants
 
-`video_backup` is an optional array; each item describes one alternative video.
+`video_backup` is an optional string array of the remaining variant URLs, ordered by the same rule as the main address; it exists for legacy clients.
+
+`video_variants` is an optional object array; each item describes one full variant. Only the best entry per quality tier is kept (largest file size first; when size is unknown, the original source wins, then bit rate).
 
 | Field | JSON type | Description |
 | --- | --- | --- |
-| `label` | string | Display label |
-| `quality` | string | Quality description |
+| `label` | string | Display label, e.g. `original` / `2160p` / `1080p` |
+| `quality` | string | Quality description, same as `label` |
 | `url` | string | URL of this video |
-| `bit_rate` | integer | Bit rate in bit/s |
+| `bit_rate` | integer | Bit rate in bit/s; may be `0` for the original 302 entry |
 | `width` / `height` | integer | Video width and height in pixels |
 | `format` | string | Media format, e.g. `mp4` or `webm` |
 | `codec` | string | Codec identifier, e.g. `h264` or `h265` |
@@ -195,6 +205,8 @@ These 16 base fields are the fixed structure of a successful media object. `size
 | `gear_name` | string | Gear name |
 | `size` | integer | Byte size of this very video; `0` when unknown |
 | `size_label` | string | Human-readable size of this very video; empty string when `size` is 0 |
+| `is_original` | boolean | Whether this is a Douyin `tos-cn-v-*` original source object |
+| `source` | string | Origin: `bit_rate` (bit-rate table) or `play_302` (vid 302) |
 
 The size of an alternative video applies only to that single address — never treat it as the size of the main video or of other alternatives.
 
@@ -605,7 +617,7 @@ Error responses always keep `code` / `msg` / `data`, with `data` as `[]`. The `m
 
 | Content platform | Media types | Optional extras |
 | --- | --- | --- |
-| Douyin | video / image / live | Videos may include `video_backup` |
+| Douyin | video / image / live | Videos may include `video_backup` and `video_variants` |
 | Xiaohongshu | video / image / live | Returned per actual content |
 | Jimeng | video / image | Returned per actual content |
 | Qianwen | video / image | Returned per actual content |

@@ -74,7 +74,8 @@ If any rights holder believes there is infringement or improper use, please cont
 
 - **Multi-Platform Support**: Douyin / Kuaishou / Xiaohongshu / Bilibili / Weibo / Toutiao and more
 - **Cookie-Free Parsing**: Douyin videos, galleries and live photos require no login or cookies
-- **Original Quality**: Douyin resolves original quality via vid 302 redirect (`quality=original`) with automatic bitrate fallback
+- **Original Quality**: Douyin resolves the `tos-cn-v-*` original source object via the `improve_bitrate=1` vid 302 redirect (`quality=original`) and merges the full `bit_rate` table, automatically picking the highest available tier (4K/2K/1080p)
+- **Full Variant List**: `video_variants` returns every tier with its real resolution, bit rate, codec (H.264/H.265), file size and whether it is an original source; the main address is picked by "resolution first, larger file size at the same resolution"
 - **Normalized Direct URLs**: Douyin video URLs are automatically given `mime_type=video_mp4` (never duplicated) so players and downloaders recognize the payload as MP4
 - **All Content Types**: Videos, image galleries and live photos share one unified response contract
 - **Dual Runtime**: PHP API + Cloudflare Workers edition (Douyin) — pick whichever fits your deployment
@@ -229,6 +230,40 @@ curl "https://your-server-domain/api/sv.php?url=https://v.douyin.com/xxxx/"
     "video_backup": [
       "https://example.com/backup_1.mp4"
     ],
+    "video_variants": [
+      {
+        "label": "original",
+        "quality": "original",
+        "url": "https://example.com/original_video.mp4",
+        "bit_rate": 0,
+        "width": 1920,
+        "height": 1080,
+        "format": "mp4",
+        "codec": "h264",
+        "quality_type": 64,
+        "gear_name": "original",
+        "size": 1823456,
+        "size_label": "1.74MB",
+        "is_original": true,
+        "source": "play_302"
+      },
+      {
+        "label": "720p",
+        "quality": "720p",
+        "url": "https://example.com/backup_1.mp4",
+        "bit_rate": 1200000,
+        "width": 1280,
+        "height": 720,
+        "format": "mp4",
+        "codec": "h264",
+        "quality_type": 4,
+        "gear_name": "normal_720_0",
+        "size": 524288,
+        "size_label": "512KB",
+        "is_original": false,
+        "source": "bit_rate"
+      }
+    ],
     "images": [],
     "live_photo": [],
     "music": {
@@ -273,7 +308,8 @@ curl "https://your-server-domain/api/sv.php?url=https://v.douyin.com/xxxx/"
 | `data.size_label`    | String       | Human-readable size (e.g. `1.74MB`)                                |
 | `data.create_time`   | Integer      | Publish timestamp in seconds                                       |
 | `data.publish_time`  | String       | Publish time (UTC+8, `Y-m-d H:i:s`)                                |
-| `data.video_backup`  | Array        | Backup video URL list (`type=video`)                               |
+| `data.video_backup`  | Array        | Backup direct URL list (`type=video`, string array, legacy-compatible) |
+| `data.video_variants`| Array        | Full variant list (`type=video`, includes resolution/bit rate/codec/size/original-source flag) |
 | `data.video_id`      | String       | Video vid (`type=video`)                                           |
 | `data.images`        | Array        | Original image URL list (`type=image/live`)                        |
 | `data.live_photo`    | Array        | Live-photo list (`type=live`, each item has `image` and `video`)   |

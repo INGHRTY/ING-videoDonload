@@ -31,10 +31,13 @@ const CORS_HEADERS = {
 };
 
 // 原画播放地址模板：传入 vid 拼接后 302 即为原画直链
-const ORIGINAL_PLAY_ENDPOINT = "https://aweme.snssdk.com/aweme/v1/play/";
+// improve_bitrate=1 是关键参数：部分作品会 302 到 tos-cn-v-* 原始源对象
+const ORIGINAL_PLAY_ENDPOINT = "https://www.douyin.com/aweme/v1/play/";
 // 批量转换 vid 时的并发数与单次上限（防止超出 Workers 子请求配额，超出的回退拼接地址）
 const VID_RESOLVE_CONCURRENCY = 8;
 const VID_RESOLVE_MAX_COUNT = 30;
+// 每个视频最多探测体积的档位数量
+const VARIANT_PROBE_LIMIT = 6;
 
 export default {
     async fetch(request) {
@@ -221,7 +224,19 @@ function buildOriginalPlayUrl(vid, ratio = "default") {
     if (!vid) {
         return null;
     }
-    return `${ORIGINAL_PLAY_ENDPOINT}?video_id=${encodeURIComponent(String(vid))}&ratio=${ratio}&line=0`;
+
+    const params = new URLSearchParams({
+        video_id: String(vid),
+        line: "0",
+        ratio,
+        watermark: "0",
+        media_type: "4",
+        vr_type: "0",
+        improve_bitrate: "1",
+        is_play_url: "1",
+        source: "PackSourceEnum_AWEME_DETAIL",
+    });
+    return `${ORIGINAL_PLAY_ENDPOINT}?${params.toString()}`;
 }
 
 // 原画核心逻辑：传入视频 vid，请求原画播放端点，302 直出原画 CDN 直链
@@ -453,6 +468,7 @@ async function buildLegacyFormatData(detail, fallbackVideoId) {
         create_time: createTime,
         publish_time: formatPublishTime(createTime),
         video_backup: [],
+        video_variants: [],
         images: [],
         live_photo: [],
         music: musicOut,
@@ -503,33 +519,23 @@ async function buildLegacyFormatData(detail, fallbackVideoId) {
         }
     } else {
         result.type = "video";
-        const videoInfo = extractHighestQualityVideo(detail);
+        const videoInfo = await extractHighestQualityVideo(detail);
 
-        let playUri = extractVidFromVideoInfo(video);
+        const playUri = extractVidFromVideoInfo(video);
         let main = videoInfo.url;
         if (main) {
             main = toHttps(main.replace(/playwm/g, "play"));
         }
 
-        // 原画优先：拿 vid 302 后的原画直链作为主地址；失败则回退原来的 main
-        const resolvedOriginal = await resolveOriginalVideoUrl(playUri);
-        if (resolvedOriginal) {
-            if (main && main !== resolvedOriginal) {
-                videoInfo.backup.unshift(main);
-            }
-            main = resolvedOriginal;
-            // 只要主链接是原画 302 出来的，画质统一标 original
-            result.quality = "original";
-        } else if (videoInfo.gearName) {
-            result.quality = videoInfo.gearName;
-        }
-
-        // 补齐 mime_type=video_mp4；主地址先归一，保证下面去重比较口径一致
+        // 主地址已经在 extractHighestQualityVideo 里按
+        // “真实分辨率 → 同分辨率体积 → 原画优先” 选好，这里只负责输出标签
+        result.quality = videoInfo.label || videoInfo.gearName || "";
         main = ensureVideoMimeType(main);
 
         if (main) {
             result.url = main;
-            result.size = await probeVideoSize(main);
+            // 最佳档位的体积已经探测过，避免重复 HEAD
+            result.size = Number(videoInfo.size) > 0 ? Number(videoInfo.size) : await probeVideoSize(main);
             result.size_label = formatSizeLabel(result.size);
         }
 
@@ -541,7 +547,7 @@ async function buildLegacyFormatData(detail, fallbackVideoId) {
             }
         }
         result.video_backup = backups;
-
+        result.video_variants = videoInfo.variants || [];
         result.video_id = playUri || fallbackVideoId;
     }
 
@@ -653,76 +659,315 @@ function collectPlayUrlCandidatesFromBitRateItem(rateItem) {
     return candidates;
 }
 
-function extractHighestQualityVideo(detail) {
-    const video = isObject(detail?.video) ? detail.video : {};
-    let bitRateList = null;
+// 汇总视频所有可用档位：
+// 1) video.bit_rate / bitRateList 的每一档（含 H.264 / HEVC、540p~4K）
+// 2) vid 走 improve_bitrate=1 的 302 结果（可能是 tos-cn-v-* 原始源对象）
+async function extractVideoVariants(video) {
+    const variants = [];
+    const seen = new Set();
 
+    let bitRateList = [];
     if (Array.isArray(video.bitRateList) && video.bitRateList.length) {
-        bitRateList = [...video.bitRateList];
+        bitRateList = video.bitRateList;
     } else if (Array.isArray(video.bit_rate) && video.bit_rate.length) {
-        bitRateList = [...video.bit_rate];
+        bitRateList = video.bit_rate;
     }
 
-    let url = null;
-    let gearName = "";
-    const backup = [];
+    for (const rateItem of bitRateList) {
+        if (!isObject(rateItem)) {
+            continue;
+        }
 
-    if (bitRateList) {
-        bitRateList.sort((a, b) => {
-            const ba = isObject(a) ? Number(a.bitRate || a.bit_rate || 0) : 0;
-            const bb = isObject(b) ? Number(b.bitRate || b.bit_rate || 0) : 0;
-            return bb - ba;
+        const candidates = collectPlayUrlCandidatesFromBitRateItem(rateItem);
+        if (!candidates.length) {
+            continue;
+        }
+
+        const picked = pickBestPlayCandidate(candidates);
+        if (!picked) {
+            continue;
+        }
+
+        const url = toHttps(picked.replace(/playwm/g, "play"));
+        const key = variantKey(url);
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+
+        const playAddr = isObject(rateItem.play_addr) ? rateItem.play_addr : {};
+        variants.push({
+            url,
+            width: Number(playAddr.width || rateItem.width || 0) || 0,
+            height: Number(playAddr.height || rateItem.height || 0) || 0,
+            bit_rate: Number(rateItem.bitRate || rateItem.bit_rate || 0) || 0,
+            quality_type: Number(rateItem.quality_type || 0) || 0,
+            gear_name: stringValue(rateItem.gearName || rateItem.gear_name || ""),
+            codec: rateItem.is_h265 || rateItem.is_bytevc1 ? "h265" : "h264",
+            format: stringValue(rateItem.format || "mp4"),
+            is_original: isOriginalSourceUrl(url),
+            source: "bit_rate",
+            size: 0,
+            size_label: "",
         });
+    }
 
-        for (const rateItem of bitRateList) {
-            if (!isObject(rateItem)) {
-                continue;
+    const vid = extractVidFromVideoInfo(video);
+    const resolved = await resolveOriginalVideoUrl(vid);
+    if (resolved) {
+        const url = toHttps(resolved.replace(/playwm/g, "play"));
+        const key = variantKey(url);
+        const isOriginal = isOriginalSourceUrl(url);
+
+        if (seen.has(key)) {
+            const existing = variants.find((item) => variantKey(item.url) === key);
+            if (existing && isOriginal) {
+                existing.is_original = true;
+                existing.quality_type = 64;
+                existing.gear_name = "original";
             }
-
-            const candidates = collectPlayUrlCandidatesFromBitRateItem(rateItem);
-            if (!candidates.length) {
-                continue;
-            }
-
-            let v3Link = null;
-            let v26Link = null;
-            for (const candidate of candidates) {
-                if (candidate.includes("v3-web")) {
-                    v3Link = candidate;
-                    break;
-                }
-                if (!v26Link && candidate.includes("v26-web")) {
-                    v26Link = candidate;
-                }
-            }
-
-            const currentBestUrl = v3Link
-                ? v3Link
-                : v26Link
-                    ? v26Link.replace(/:\/\/([^/]+)/, "://v26-luna.douyinvod.com")
-                    : candidates[0];
-
-            if (!url) {
-                url = currentBestUrl;
-                gearName = stringValue(rateItem.gearName || rateItem.gear_name || "");
-            }
-
-            for (let candidate of candidates) {
-                if (candidate.includes("v26-web")) {
-                    candidate = candidate.replace(/:\/\/([^/]+)/, "://v26-luna.douyinvod.com");
-                }
-                if (candidate !== url && !backup.includes(candidate)) {
-                    backup.push(candidate);
-                }
-            }
-
-            if (url && backup.length) {
-                break;
-            }
+        } else {
+            seen.add(key);
+            const playAddr = isObject(video.play_addr) ? video.play_addr : {};
+            variants.push({
+                url,
+                width: Number(playAddr.width || video.width || 0) || 0,
+                height: Number(playAddr.height || video.height || 0) || 0,
+                bit_rate: 0,
+                quality_type: isOriginal ? 64 : 0,
+                gear_name: isOriginal ? "original" : "",
+                codec: video.is_h265 || video.is_bytevc1 ? "h265" : "h264",
+                format: "mp4",
+                is_original: isOriginal,
+                source: "play_302",
+                size: 0,
+                size_label: "",
+            });
         }
     }
 
-    if (!url) {
+    return variants;
+}
+
+// 从一档的多个候选地址里挑最稳的一个：v3-web 优先，v26-web 换域名，否则第一个
+function pickBestPlayCandidate(candidates) {
+    let v3Link = null;
+    let v26Link = null;
+
+    for (const candidate of candidates) {
+        if (!candidate) {
+            continue;
+        }
+        if (!v3Link && candidate.includes("v3-web")) {
+            v3Link = candidate;
+        }
+        if (!v26Link && candidate.includes("v26-web")) {
+            v26Link = candidate;
+        }
+    }
+
+    if (v3Link) {
+        return v3Link;
+    }
+    if (v26Link) {
+        return v26Link.replace(/:\/\/([^/]+)/, "://v26-luna.douyinvod.com");
+    }
+    return candidates[0];
+}
+
+// 同一对象的去重 key：忽略 CDN 域名和签名，只保留 tos bucket + object id
+function variantKey(url) {
+    if (typeof url !== "string") {
+        return "";
+    }
+    const match = url.match(/\/video\/tos\/cn\/([^/?]+\/[^/?]+)/);
+    return match ? match[1] : url;
+}
+
+// 是否抖音原始源对象（tos-cn-v-*）；tos-cn-ve-* / tos-cn-vd-* 都是转码/分发对象
+function isOriginalSourceUrl(url) {
+    return typeof url === "string" && url.includes("/tos-cn-v-");
+}
+
+// 画质标签：优先标 original，其次按短边归一到 540p/720p/1080p/1440p/2160p
+function variantLabel(variant) {
+    if (variant?.is_original) {
+        return "original";
+    }
+
+    const label = resolutionLabel(variant?.width, variant?.height);
+    if (label) {
+        return label;
+    }
+
+    const gear = stringValue(variant?.gear_name);
+    if (gear) {
+        return gear;
+    }
+
+    const bitRate = Number(variant?.bit_rate) || 0;
+    return bitRate > 0 ? `${Math.round(bitRate / 1000)}kbps` : "";
+}
+
+// 分辨率短边 → 常见画质档位标签
+function resolutionLabel(width, height) {
+    const w = Number(width) || 0;
+    const h = Number(height) || 0;
+    if (w <= 0 || h <= 0) {
+        return "";
+    }
+
+    const short = Math.min(w, h);
+    if (short >= 2000) return "2160p";
+    if (short >= 1400) return "1440p";
+    if (short >= 1000) return "1080p";
+    if (short >= 700) return "720p";
+    if (short >= 500) return "540p";
+    return `${short}p`;
+}
+
+// 档位排序：真实分辨率降序 → 同分辨率体积降序 → 原画优先 → 码率降序
+function sortVideoVariants(variants) {
+    variants.sort((a, b) => {
+        const pa = (Number(a.width) || 0) * (Number(a.height) || 0);
+        const pb = (Number(b.width) || 0) * (Number(b.height) || 0);
+        if (pa !== pb) {
+            return pb - pa;
+        }
+
+        const sa = Number(a.size) || 0;
+        const sb = Number(b.size) || 0;
+        if (sa > 0 || sb > 0) {
+            if (sa !== sb) {
+                return sb - sa;
+            }
+        }
+
+        if (Boolean(a.is_original) !== Boolean(b.is_original)) {
+            return a.is_original ? -1 : 1;
+        }
+
+        return (Number(b.bit_rate) || 0) - (Number(a.bit_rate) || 0);
+    });
+}
+
+// 选择要探测体积的档位：原画必测，其余每个画质档位取码率最高的一条
+function selectProbeCandidates(variants, limit = VARIANT_PROBE_LIMIT) {
+    const indices = [];
+    const tierCandidates = new Map();
+
+    variants.forEach((variant, index) => {
+        if (variant.is_original) {
+            if (!indices.includes(index)) {
+                indices.push(index);
+            }
+            return;
+        }
+
+        const label = resolutionLabel(variant.width, variant.height);
+        const key = label || variant.gear_name || variantKey(variant.url);
+        const currentIndex = tierCandidates.get(key);
+        if (currentIndex === undefined) {
+            tierCandidates.set(key, index);
+            return;
+        }
+
+        const current = variants[currentIndex];
+        if ((Number(variant.bit_rate) || 0) > (Number(current.bit_rate) || 0)) {
+            tierCandidates.set(key, index);
+        }
+    });
+
+    const ordered = [...tierCandidates.values()]
+        .map((index) => ({
+            index,
+            pixels: (Number(variants[index].width) || 0) * (Number(variants[index].height) || 0),
+        }))
+        .sort((a, b) => b.pixels - a.pixels);
+
+    for (const item of ordered) {
+        if (!indices.includes(item.index)) {
+            indices.push(item.index);
+        }
+        if (indices.length >= limit) {
+            break;
+        }
+    }
+
+    return indices;
+}
+
+// 并发探测选中的档位体积（HEAD，不下载正文）
+async function probeVariantSizes(variants, limit = VARIANT_PROBE_LIMIT) {
+    const indices = selectProbeCandidates(variants, limit);
+    await Promise.all(
+        indices.map(async (index) => {
+            const variant = variants[index];
+            variant.size = await probeVideoSize(variant.url);
+            variant.size_label = formatSizeLabel(variant.size);
+        })
+    );
+}
+
+// 同画质档位只保留最优档位：体积最大者优先；体积未知时原画优先，其次码率
+function dedupeVideoVariants(variants) {
+    const byTier = new Map();
+
+    for (const variant of variants) {
+        const label = resolutionLabel(variant.width, variant.height);
+        const key = label || variant.gear_name || variantKey(variant.url);
+        const current = byTier.get(key);
+        if (!current || isBetterVariant(variant, current)) {
+            byTier.set(key, variant);
+        }
+    }
+
+    return [...byTier.values()];
+}
+
+function isBetterVariant(a, b) {
+    const sa = Number(a.size) || 0;
+    const sb = Number(b.size) || 0;
+    if (sa > 0 || sb > 0) {
+        if (sa !== sb) {
+            return sa > sb;
+        }
+    }
+
+    if (Boolean(a.is_original) !== Boolean(b.is_original)) {
+        return Boolean(a.is_original);
+    }
+
+    return (Number(a.bit_rate) || 0) > (Number(b.bit_rate) || 0);
+}
+
+// 单个档位转成统一 JSON 契约里的对象
+function formatVariantOutput(variant) {
+    const label = variantLabel(variant);
+    return {
+        label,
+        quality: label,
+        url: variant.url,
+        bit_rate: Number(variant.bit_rate) || 0,
+        width: Number(variant.width) || 0,
+        height: Number(variant.height) || 0,
+        format: variant.format || "mp4",
+        codec: variant.codec || "",
+        quality_type: Number(variant.quality_type) || 0,
+        gear_name: variant.gear_name || "",
+        size: Number(variant.size) || 0,
+        size_label: variant.size_label || "",
+        is_original: Boolean(variant.is_original),
+        source: variant.source || "",
+    };
+}
+
+async function extractHighestQualityVideo(detail) {
+    const video = isObject(detail?.video) ? detail.video : {};
+    let variants = await extractVideoVariants(video);
+
+    if (!variants.length) {
+        // 极端兜底：没有任何 bit_rate 档位时，沿用 play_addr / playApi
         let uri = stringValue(video.uri);
         if (!uri && isObject(video.play_addr) && video.play_addr.uri) {
             uri = String(video.play_addr.uri);
@@ -735,30 +980,56 @@ function extractHighestQualityVideo(detail) {
                     ? video.play_addr.url_list[0]
                     : "";
 
-        if (playApi) {
-            url = playApi.replace(/playwm/g, "play");
-        } else if (uri) {
-            // 原画兜底地址：buildLegacyFormatData 会用 vid 走 resolveOriginalVideoUrl 做 302 解析，失败回退此地址
-            url = buildOriginalPlayUrl(uri);
-        }
+        let url = playApi ? playApi.replace(/playwm/g, "play") : uri ? buildOriginalPlayUrl(uri) : null;
+        url = url ? toHttps(url.replace(/playwm/g, "play")) : null;
 
-        const urlList = isObject(video.play_addr) && Array.isArray(video.play_addr.url_list)
-            ? video.play_addr.url_list
-            : [];
-        if (urlList.length > 1) {
-            urlList.forEach((link, index) => {
-                if (index === 0 || typeof link !== "string") {
-                    return;
-                }
-                const converted = link.replace(/playwm/g, "play");
-                if (converted && converted !== url && !backup.includes(converted)) {
-                    backup.push(converted);
-                }
-            });
-        }
+        return {
+            url,
+            backup: [],
+            gearName: "",
+            variants: [],
+            is_original: isOriginalSourceUrl(url),
+            label: variantLabel({
+                is_original: isOriginalSourceUrl(url),
+                width: 0,
+                height: 0,
+                gear_name: "",
+                bit_rate: 0,
+            }),
+            size: 0,
+        };
     }
 
-    return {url, backup, gearName};
+    sortVideoVariants(variants);
+    await probeVariantSizes(variants, VARIANT_PROBE_LIMIT);
+    sortVideoVariants(variants);
+    variants = dedupeVideoVariants(variants);
+    sortVideoVariants(variants);
+
+    const best = variants[0];
+    const backup = [];
+    const variantOutput = [];
+
+    variants.forEach((variant, index) => {
+        variant.url = ensureVideoMimeType(variant.url);
+        if (index > 0 && variant.url && !backup.includes(variant.url)) {
+            backup.push(variant.url);
+        }
+    });
+
+    for (const variant of variants) {
+        variantOutput.push(formatVariantOutput(variant));
+    }
+
+    return {
+        url: ensureVideoMimeType(best.url),
+        backup,
+        gearName: best.gear_name || "",
+        variants: variantOutput,
+        is_original: Boolean(best.is_original),
+        label: variantLabel(best),
+        size: Number(best.size) || 0,
+    };
 }
 
 // 统一响应契约辅助：1024 进制 B/KB/MB/GB/TB，最多两位小数且不保留尾部 0
@@ -830,7 +1101,10 @@ async function probeVideoSize(url) {
     try {
         const response = await fetch(url, {
             method: "HEAD",
-            headers: {"user-agent": DEFAULT_UA},
+            headers: {
+                "user-agent": DEFAULT_UA,
+                referer: "https://www.douyin.com/",
+            },
         });
         if (!response.ok) {
             return 0;
