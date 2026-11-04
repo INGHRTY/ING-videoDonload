@@ -28,13 +28,6 @@
   </p>
 </div>
 
-<div align="center">
-  <p><small>赞助 · Sponsored</small></p>
-  <a href="https://www.hncloud.com/" target="_blank" rel="noopener noreferrer">
-    <img src="img/hncloud_ad.jpg" alt="华纳云 - 点击访问官网" width="728" />
-  </a>
-  <p><a href="https://www.hncloud.com/" target="_blank" rel="noopener noreferrer">华纳云 | 点击访问官网 →</a></p>
-</div>
 
 ---
 
