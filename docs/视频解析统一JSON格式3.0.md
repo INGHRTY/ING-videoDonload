@@ -102,7 +102,7 @@
 
 ## 1. 视频类型（video）
 
-`url` 为主视频地址，`images` 和 `live_photo` 为 `[]`。如有备选视频，可额外返回 `video_backup`。
+`url` 为主视频地址，`images` 和 `live_photo` 为 `[]`。如有备选视频，可额外返回 `video_backup`（兼容旧版的字符串数组）和 `video_variants`（完整档位对象数组）。主地址的选取规则是：**真实分辨率优先 → 同分辨率文件体积优先 → 原画源优先 → 码率优先**。
 
 ```json
 {
@@ -128,19 +128,25 @@
     "images": [],
     "live_photo": [],
     "video_backup": [
+      "https://example.com/video_720p.mp4",
+      "https://example.com/video_540p.mp4"
+    ],
+    "video_variants": [
       {
-        "label": "1080p",
-        "quality": "1080p",
-        "url": "https://example.com/video_1080p.mp4",
-        "bit_rate": 2500000,
+        "label": "original",
+        "quality": "original",
+        "url": "https://example.com/video_original.mp4",
+        "bit_rate": 0,
         "width": 1920,
         "height": 1080,
         "format": "mp4",
-        "codec": "h265",
-        "quality_type": 8,
-        "gear_name": "正常",
-        "size": 10485760,
-        "size_label": "10.00MB"
+        "codec": "h264",
+        "quality_type": 64,
+        "gear_name": "original",
+        "size": 104857600,
+        "size_label": "100MB",
+        "is_original": true,
+        "source": "play_302"
       },
       {
         "label": "720p",
@@ -152,9 +158,11 @@
         "format": "mp4",
         "codec": "h264",
         "quality_type": 4,
-        "gear_name": "流畅",
+        "gear_name": "normal_720_0",
         "size": 5242880,
-        "size_label": "5.00MB"
+        "size_label": "5.00MB",
+        "is_original": false,
+        "source": "bit_rate"
       }
     ],
     "music": {
@@ -178,16 +186,18 @@
 }
 ```
 
-### video_backup
+### video_backup 与 video_variants
 
-`video_backup` 是可选数组，每项描述一个备选视频。
+`video_backup` 是可选字符串数组，按主地址的排序规则给出其余档位的直链，便于兼容旧客户端。
+
+`video_variants` 是可选对象数组，每项描述一个完整档位。同一画质档位只保留最优的一条（体积最大者优先；体积未知时原画优先，其次码率）。
 
 | 字段 | JSON 类型 | 说明 |
 | --- | --- | --- |
-| `label` | string | 展示标签 |
-| `quality` | string | 画质描述 |
+| `label` | string | 展示标签，如 `original` / `2160p` / `1080p` |
+| `quality` | string | 画质描述，与 `label` 一致 |
 | `url` | string | 该视频的 URL |
-| `bit_rate` | integer | 码率，单位 bit/s |
+| `bit_rate` | integer | 码率，单位 bit/s；原画 302 条目可能为 0 |
 | `width` / `height` | integer | 视频宽度和高度，单位像素 |
 | `format` | string | 媒体格式，如 `mp4` 或 `webm` |
 | `codec` | string | 编解码标识，如 `h264` 或 `h265` |
@@ -195,6 +205,8 @@
 | `gear_name` | string | 档位名称 |
 | `size` | integer | 该条视频自身的字节数；未知时为 0 |
 | `size_label` | string | 该条视频大小的可读说明；`size` 为 0 时为空串 |
+| `is_original` | boolean | 是否为抖音 `tos-cn-v-*` 原始源对象 |
+| `source` | string | 来源：`bit_rate`（码率表）或 `play_302`（vid 302） |
 
 备选视频的大小只对应这一条地址，不能当作主视频或其他备选视频的大小。
 
@@ -605,7 +617,7 @@ X-API-Key: YOUR_ACCESS_KEY
 
 | 内容平台 | 媒体类型 | 可选附加内容 |
 | --- | --- | --- |
-| 抖音 | video / image / live | 视频可包含 `video_backup` |
+| 抖音 | video / image / live | 视频可包含 `video_backup` 与 `video_variants` |
 | 小红书 | video / image / live | 按实际内容返回 |
 | 即梦 | video / image | 按实际内容返回 |
 | 千问 | video / image | 按实际内容返回 |

@@ -62,7 +62,8 @@
 
 - **多平台支持**：抖音 / 快手 / 小红书 / 哔哩哔哩 / 微博 / 今日头条等主流平台
 - **免 Cookie 解析**：抖音视频、图集、实况均无需登录与 Cookie 配置
-- **原画直链**：抖音自动通过 vid 302 解析原画（`quality=original`），多档码率自动降级
+- **原画直链**：抖音通过 `improve_bitrate=1` 的 vid 302 解析 `tos-cn-v-*` 原始源对象（`quality=original`），同时合并完整 `bit_rate` 码率表，自动挑选 4K/2K/1080p 等最高可用档位
+- **全量码率档位**：返回 `video_variants`，包含每档的真实分辨率、码率、编码（H.264/H.265）、文件大小和是否原画源；主地址按“分辨率优先、同分辨率体积优先”自动选择
 - **直链规范**：抖音视频直链自动补齐 `mime_type=video_mp4`（已存在则不重复追加），便于播放器与下载器直接识别为 MP4
 - **类型全覆盖**：短视频、图文图集、实况（Live Photo）统一契约输出
 - **双运行时**：PHP 接口 + Cloudflare Workers 版（抖音），按部署环境任选
@@ -217,6 +218,40 @@ curl "https://你的服务器地址/api/sv.php?url=https://v.douyin.com/xxxx/"
     "video_backup": [
       "https://example.com/backup_1.mp4"
     ],
+    "video_variants": [
+      {
+        "label": "original",
+        "quality": "original",
+        "url": "https://example.com/original_video.mp4",
+        "bit_rate": 0,
+        "width": 1920,
+        "height": 1080,
+        "format": "mp4",
+        "codec": "h264",
+        "quality_type": 64,
+        "gear_name": "original",
+        "size": 1823456,
+        "size_label": "1.74MB",
+        "is_original": true,
+        "source": "play_302"
+      },
+      {
+        "label": "720p",
+        "quality": "720p",
+        "url": "https://example.com/backup_1.mp4",
+        "bit_rate": 1200000,
+        "width": 1280,
+        "height": 720,
+        "format": "mp4",
+        "codec": "h264",
+        "quality_type": 4,
+        "gear_name": "normal_720_0",
+        "size": 524288,
+        "size_label": "512KB",
+        "is_original": false,
+        "source": "bit_rate"
+      }
+    ],
     "images": [],
     "live_photo": [],
     "music": {
@@ -261,7 +296,8 @@ curl "https://你的服务器地址/api/sv.php?url=https://v.douyin.com/xxxx/"
 | `data.size_label` | 字符串 | 人类可读大小（如 `1.74MB`） |
 | `data.create_time` | 整数 | 发布时间戳（秒） |
 | `data.publish_time` | 字符串 | 发布时间（东八区 `Y-m-d H:i:s`） |
-| `data.video_backup` | 数组 | 备选直链列表（`type=video`） |
+| `data.video_backup` | 数组 | 备选直链列表（`type=video`，字符串数组，兼容旧版） |
+| `data.video_variants` | 数组 | 完整档位列表（`type=video`，含分辨率/码率/编码/体积/是否原画源） |
 | `data.video_id` | 字符串 | 视频 vid（`type=video`） |
 | `data.images` | 数组 | 图集原图 URL 数组（`type=image/live`） |
 | `data.live_photo` | 数组 | 实况图数组（`type=live`，每项含 `image` 和 `video`） |
