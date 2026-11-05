@@ -186,6 +186,17 @@ These 16 base fields are the fixed structure of a successful media object. `size
 }
 ```
 
+### Request params: choosing a resolution (optional)
+
+The Douyin endpoint accepts two optional params that make the requested variant the main address; without them the highest quality is returned:
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `quality` | string | Variant label (`2160p` / `1080p`), real height (`1080`), codec (`h264` / `h265`) or `original`; combine with `-` (e.g. `1080p-h264`). Falls back to the highest quality when nothing matches. |
+| `variant` | integer | Index into `data.video_variants` (0-based); takes precedence over `quality`. |
+
+Put the params before `url` (`?quality=720p&url=...`); the aggregate entry `sv.php` forwards them. The chosen variant fills `data.url` / `data.quality` / `data.size`, while `data.video_variants` still lists every variant.
+
 ### video_backup and video_variants
 
 `video_backup` is an optional string array of the remaining variant URLs, ordered by the same rule as the main address; it exists for legacy clients.

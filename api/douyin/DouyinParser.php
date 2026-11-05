@@ -38,10 +38,22 @@ class DouyinParser
     private const REQUEST_TIMEOUT = 20;
 
     /**
-     * 主解析入口
+     * 调用方指定的清晰度偏好：
+     * - quality：'1080p' / '1080' / 'h264' / 'original'，也支持 '1080p-h264' 组合
+     * - variant：排序后的档位下标（0 起），优先级高于 quality
      */
-    public function parse($input)
+    private $preference = ['quality' => '', 'variant' => null];
+
+    /**
+     * 主解析入口
+     *
+     * @param string $input   分享链接或整段分享文案
+     * @param array  $options quality / variant，用于指定输出档位
+     */
+    public function parse($input, array $options = [])
     {
+        $this->preference = $this->normalizePreference($options);
+
         if (empty($input) || !is_string($input)) {
             return $this->output(400, '请输入抖音链接');
         }
@@ -506,6 +518,7 @@ class DouyinParser
                 'backup' => [],
                 'gearName' => '',
                 'variants' => [],
+                'selected_index' => 0,
                 'is_original' => $this->isOriginalSourceUrl($url),
                 'label' => $this->variantLabel([
                     'is_original' => $this->isOriginalSourceUrl($url),
@@ -525,13 +538,18 @@ class DouyinParser
         $this->dedupeVideoVariants($variants);
         $this->sortVideoVariants($variants);
 
-        $best = $variants[0];
+        // 按调用方偏好选档：variant 下标优先，其次 quality 标签/高度/编码匹配
+        $selectedIndex = $this->selectVariantIndex($variants);
+        $best = $variants[$selectedIndex];
         $backup = [];
         $variantOutput = [];
 
         foreach ($variants as $index => $variant) {
+            if ($index === $selectedIndex) {
+                continue;
+            }
             $url = $this->ensureVideoMimeType($variant['url']);
-            if ($index > 0 && $url !== '' && !in_array($url, $backup, true)) {
+            if ($url !== '' && !in_array($url, $backup, true)) {
                 $backup[] = $url;
             }
         }
@@ -545,10 +563,139 @@ class DouyinParser
             'backup' => $backup,
             'gearName' => $this->strv($best['gear_name'] ?? ''),
             'variants' => $variantOutput,
+            'selected_index' => $selectedIndex,
             'is_original' => !empty($best['is_original']),
             'label' => $this->variantLabel($best),
             'size' => (int)($best['size'] ?? 0),
         ];
+    }
+
+    /**
+     * 归一化清晰度偏好参数
+     */
+    private function normalizePreference(array $options)
+    {
+        $quality = isset($options['quality']) && is_scalar($options['quality'])
+            ? strtolower(trim((string)$options['quality']))
+            : '';
+
+        $variant = $options['variant'] ?? null;
+        if (is_string($variant) && $variant !== '' && ctype_digit($variant)) {
+            $variant = (int)$variant;
+        } elseif (!is_int($variant)) {
+            $variant = null;
+        }
+        if ($variant !== null && $variant < 0) {
+            $variant = null;
+        }
+
+        return ['quality' => $quality, 'variant' => $variant];
+    }
+
+    /**
+     * 选出输出档位下标：variant 直取下标，quality 依次匹配标签 / 高度 / 编码 / 原画，
+     * 都匹配不上时回退到排序后的第一档（最高画质）。
+     */
+    private function selectVariantIndex(array $variants)
+    {
+        $count = count($variants);
+        if ($count === 0) {
+            return 0;
+        }
+
+        $variant = $this->preference['variant'];
+        if ($variant !== null) {
+            return isset($variants[$variant]) ? $variant : 0;
+        }
+
+        $quality = $this->preference['quality'];
+        if ($quality === '' || $quality === 'auto' || $quality === 'best' || $quality === 'highest') {
+            return 0;
+        }
+
+        $parts = preg_split('/[-_\/\s]+/', $quality) ?: [$quality];
+
+        foreach ($variants as $index => $item) {
+            if ($this->variantMatchesPreference($item, $quality, $parts)) {
+                return $index;
+            }
+        }
+
+        // 纯数字但没精确命中时，取不超过请求高度的最高一档
+        if (ctype_digit($quality)) {
+            $want = (int)$quality;
+            $fallback = null;
+            foreach ($variants as $index => $item) {
+                $height = (int)($item['height'] ?? 0);
+                if ($height > 0 && $height <= $want) {
+                    if ($fallback === null || $height > (int)($variants[$fallback]['height'] ?? 0)) {
+                        $fallback = $index;
+                    }
+                }
+            }
+            if ($fallback !== null) {
+                return $fallback;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * 判断一档是否满足清晰度条件；组合写法（如 1080p-h264）要求全部条件成立
+     */
+    private function variantMatchesPreference(array $variant, $quality, array $parts)
+    {
+        // 原始档位没有 label 字段，用 variantLabel 现算，保证 1080p / 2160p 这类写法可命中
+        $label = strtolower(trim((string)($variant['label'] ?? $this->variantLabel($variant))));
+        $gear = strtolower(trim((string)($variant['gear_name'] ?? '')));
+        $codec = strtolower(trim((string)($variant['codec'] ?? '')));
+        $height = (int)($variant['height'] ?? 0);
+        $isOriginal = !empty($variant['is_original']);
+
+        if ($quality === 'original' || $quality === 'raw') {
+            return $isOriginal;
+        }
+        if ($quality === $label || ($gear !== '' && $quality === $gear)) {
+            return true;
+        }
+        if (ctype_digit($quality)) {
+            return $height === (int)$quality;
+        }
+        // 1080p / 2160p 这类写法按真实高度匹配，避免原始档位 label 是 original 时匹配不上
+        if (preg_match('/^(\d{3,4})p$/', $quality, $m)) {
+            return $height === (int)$m[1];
+        }
+
+        foreach ($parts as $part) {
+            if ($part === '') {
+                continue;
+            }
+            if ($part === 'original' || $part === 'raw') {
+                if ($isOriginal) {
+                    continue;
+                }
+                return false;
+            }
+            if ($part === $codec) {
+                continue;
+            }
+            if (ctype_digit($part)) {
+                if ((int)$part === $height) {
+                    continue;
+                }
+                return false;
+            }
+            if (preg_match('/^(\d{3,4})p$/', $part, $m) && (int)$m[1] === $height) {
+                continue;
+            }
+            if (strpos($label, $part) === 0 || ($gear !== '' && strpos($gear, $part) === 0)) {
+                continue;
+            }
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -1101,6 +1248,9 @@ class DouyinParser
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_FOLLOWLOCATION => false,
                 CURLOPT_HEADER => true,
+                // 只要 302 的 Location 头；个别情况接口直接回 200 视频体，
+                // 用 Range 限成 1 字节，避免把整个原画（GB 级）读进内存
+                CURLOPT_RANGE => '0-0',
                 CURLOPT_TIMEOUT => 10,
                 CURLOPT_SSL_VERIFYPEER => false,
                 CURLOPT_SSL_VERIFYHOST => false,

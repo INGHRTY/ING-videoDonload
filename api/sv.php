@@ -245,6 +245,18 @@ if (!$url && isset($_GET['url'])) {
     $url = trim($_GET['url']);
 }
 
+// 清晰度偏好透传（quality=1080p / variant=2）。放在 url 之前拼接，
+// 避免下游入口把 &quality= 误当成链接的一部分。
+$passthrough = [];
+foreach (['quality', 'variant'] as $paramKey) {
+    foreach ([$_GET, $_POST] as $source) {
+        if (isset($source[$paramKey]) && is_scalar($source[$paramKey]) && trim((string)$source[$paramKey]) !== '') {
+            $passthrough[$paramKey] = trim((string)$source[$paramKey]);
+            break;
+        }
+    }
+}
+
 if ($url === '' || ($shareUrl = extractShareUrl($url)) === null) {
     outputJson(['code' => 400, 'msg' => '请输入有效的链接', 'data' => []], 200);
 }
@@ -259,7 +271,8 @@ if ($requestHost === '') {
     outputJson(['code' => 500, 'msg' => '无法确定本站域名，请在 api/sv.php 配置 $allowedHosts', 'data' => []], 200);
 }
 
-$endpoint = buildEndpoint($platform['path'], $requestHost) . '?url=' . urlencode($shareUrl);
+$endpoint = buildEndpoint($platform['path'], $requestHost);
+$endpoint .= '?' . ($passthrough ? http_build_query($passthrough) . '&' : '') . 'url=' . urlencode($shareUrl);
 $response = requestUrl($endpoint, $requestTimeout);
 
 if ($response === false) {

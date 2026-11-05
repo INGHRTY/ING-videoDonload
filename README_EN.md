@@ -193,6 +193,28 @@ curl "https://api.bugpk.com/api/douyin/douyin.php?url=https://v.douyin.com/xxxx/
 > The Douyin API accepts full share texts with copywriting, e.g.:
 > `?url=7.79 Copy and open Douyin... https://v.douyin.com/xxxx/`
 
+### Choosing a Resolution (optional)
+
+By default the highest quality is returned. To pick a specific variant, add `quality` or `variant` **before** `url`:
+
+```bash
+# By label / real height / codec
+curl "https://your-server-domain/api/douyin/douyin.php?quality=720p&url=https://v.douyin.com/xxxx/"
+curl "https://your-server-domain/api/douyin/douyin.php?quality=1080&url=https://v.douyin.com/xxxx/"
+curl "https://your-server-domain/api/douyin/douyin.php?quality=1080p-h264&url=https://v.douyin.com/xxxx/"
+curl "https://your-server-domain/api/douyin/douyin.php?quality=original&url=https://v.douyin.com/xxxx/"
+
+# By index (order of data.video_variants, 0 = highest quality)
+curl "https://your-server-domain/api/douyin/douyin.php?variant=2&url=https://v.douyin.com/xxxx/"
+```
+
+| Param | Value | Description |
+| --- | --- | --- |
+| `quality` | `2160p` / `1080` / `720p` / `h264` / `h265` / `original` | Matches the variant label, real height or codec; combine with `-` (e.g. `1080p-h264`). Falls back to the highest quality when nothing matches. |
+| `variant` | `0` ~ `n-1` | Index into `data.video_variants`; takes precedence over `quality`. |
+
+The chosen variant fills `data.url` / `data.quality` / `data.size`, while the full list stays in `data.video_variants`. The aggregate entry `api/sv.php` forwards both params to the platform parser.
+
 ### Aggregate Parsing (Auto Dispatch)
 
 Use the aggregate endpoint `api/sv.php` when you don't want to distinguish platforms — it auto-detects the platform and forwards to the matching per-platform API:
