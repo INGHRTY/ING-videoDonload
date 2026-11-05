@@ -235,12 +235,14 @@ function douyin_proxy($proxyurl, $resolve)
         exit;
     }
 
+    // 冷存储对象（*-colds.douyinvod.com）对 Referer 敏感：
+    // 带 https://douyin.com/ 直接 403，带 https://www.douyin.com/ 或不带才正常。
+    // 所以 Referer 不写进基础头，交给下面的两段式重试决定。
     $baseHeaders = [
         'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept: video/mp4,video/x-m4v,video/*;q=0.9,*/*;q=0.8',
         'Accept-Language: zh-CN,zh;q=0.9',
-        'Connection: keep-alive',
-        'Referer: https://douyin.com/'
+        'Connection: keep-alive'
     ];
 
     // 浏览器拖动进度条 / 断点续传：把客户端的 Range 透传给上游
@@ -253,67 +255,95 @@ function douyin_proxy($proxyurl, $resolve)
     @set_time_limit(0);
     @ini_set('max_execution_time', '0');
 
-    $ch = curl_init();
-    if ($ch === false) {
-        http_response_code(500);
-        echo json_encode(['code' => 500, 'msg' => 'cURL初始化失败']);
-        return;
-    }
+    // 两段式请求头：先按站内 Referer 取，403/404 时退到不带 Referer 再试一次。
+    // 只有上游还没开始回体时才会重试，避免向客户端写出半截数据。
+    $attempts = [
+        array_merge($baseHeaders, ['Referer: https://www.douyin.com/']),
+        $baseHeaders,
+    ];
 
     $responseHeaders = [];
     $upstreamStatus = 0;
     $headersSent = false;
+    $httpCode = 0;
+    $curlErrno = 0;
 
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $proxyurl,
-        CURLOPT_RETURNTRANSFER => false,
-        CURLOPT_HTTPHEADER => $baseHeaders,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
-        CURLOPT_TIMEOUT => 0,
-        CURLOPT_CONNECTTIMEOUT => 10,
-        // 防 DNS 重绑定：将校验过的域名固定到已验证的公网 IP
-        CURLOPT_RESOLVE => ["{$resolve['host']}:{$resolve['port']}:{$resolve['ip']}"],
-        CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders, &$upstreamStatus) {
-            $len = strlen($header);
-            if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $header, $m)) {
-                $upstreamStatus = (int)$m[1];
-                // 跟随重定向时只保留最后一跳的响应头
-                $responseHeaders = [];
+    foreach ($attempts as $attemptIndex => $attemptHeaders) {
+        $ch = curl_init();
+        if ($ch === false) {
+            http_response_code(500);
+            echo json_encode(['code' => 500, 'msg' => 'cURL初始化失败']);
+            return;
+        }
+
+        $responseHeaders = [];
+        $upstreamStatus = 0;
+        $headersSent = false;
+
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $proxyurl,
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_HTTPHEADER => $attemptHeaders,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_TIMEOUT => 0,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            // 防 DNS 重绑定：将校验过的域名固定到已验证的公网 IP
+            CURLOPT_RESOLVE => ["{$resolve['host']}:{$resolve['port']}:{$resolve['ip']}"],
+            CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders, &$upstreamStatus) {
+                $len = strlen($header);
+                if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $header, $m)) {
+                    $upstreamStatus = (int)$m[1];
+                    // 跟随重定向时只保留最后一跳的响应头
+                    $responseHeaders = [];
+                    return $len;
+                }
+                $headerParts = explode(':', $header, 2);
+                if (count($headerParts) >= 2) {
+                    $responseHeaders[strtolower(trim($headerParts[0]))] = trim($headerParts[1]);
+                }
                 return $len;
-            }
-            $headerParts = explode(':', $header, 2);
-            if (count($headerParts) >= 2) {
-                $responseHeaders[strtolower(trim($headerParts[0]))] = trim($headerParts[1]);
-            }
-            return $len;
-        },
-        CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$responseHeaders, &$upstreamStatus, &$headersSent, $proxyurl) {
-            if (!$headersSent) {
-                send_douyin_video_headers($upstreamStatus, $responseHeaders, $proxyurl);
-                $headersSent = true;
-            }
-            echo $data;
-            if (ob_get_length() > 0) {
-                ob_flush();
-            }
-            flush();
-            return strlen($data);
-        },
-    ]);
+            },
+            CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$responseHeaders, &$upstreamStatus, &$headersSent, $proxyurl) {
+                if (!$headersSent) {
+                    if ($upstreamStatus >= 400) {
+                        // 上游报错且一个字节都没回：中止本次，换下一组请求头重试
+                        return 0;
+                    }
+                    send_douyin_video_headers($upstreamStatus, $responseHeaders, $proxyurl);
+                    $headersSent = true;
+                }
+                echo $data;
+                if (ob_get_length() > 0) {
+                    ob_flush();
+                }
+                flush();
+                return strlen($data);
+            },
+        ]);
 
-    curl_exec($ch);
-    $curlErrno = curl_errno($ch);
-    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+        curl_exec($ch);
+        $curlErrno = curl_errno($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // 已经在往客户端写数据，不能再换头重试
+        if ($headersSent) {
+            break;
+        }
+        // 上游正常但没回体（如 204），或已经试到最后一段，直接收尾
+        if (($httpCode > 0 && $httpCode < 400) || $attemptIndex === count($attempts) - 1) {
+            break;
+        }
+    }
 
     // 上游没有响应体（403/404 等）：补发状态码，让前端能显示真实原因
     if (!$headersSent) {
         send_douyin_video_headers($upstreamStatus ?: $httpCode, $responseHeaders, $proxyurl);
     }
 
-    if ($curlErrno !== 0) {
+    if ($curlErrno !== 0 && !$headersSent) {
         error_log('视频传输失败: ' . curl_strerror($curlErrno) . ' URL: ' . $proxyurl);
     } elseif ($httpCode === 403) {
         error_log('上游 403（链接可能已过期或与请求 IP 绑定） URL: ' . $proxyurl);
