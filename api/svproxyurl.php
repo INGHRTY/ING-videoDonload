@@ -243,6 +243,16 @@ function douyin_proxy($proxyurl, $resolve)
         'Referer: https://douyin.com/'
     ];
 
+    // 浏览器拖动进度条 / 断点续传：把客户端的 Range 透传给上游
+    $clientRange = isset($_SERVER['HTTP_RANGE']) ? trim((string)$_SERVER['HTTP_RANGE']) : '';
+    if ($clientRange !== '' && preg_match('/^bytes=\d*-\d*$/', $clientRange)) {
+        $baseHeaders[] = 'Range: ' . $clientRange;
+    }
+
+    // GB 级原画是逐块转发的，不能被 PHP 默认执行时间掐断
+    @set_time_limit(0);
+    @ini_set('max_execution_time', '0');
+
     $ch = curl_init();
     if ($ch === false) {
         http_response_code(500);
@@ -251,6 +261,8 @@ function douyin_proxy($proxyurl, $resolve)
     }
 
     $responseHeaders = [];
+    $upstreamStatus = 0;
+    $headersSent = false;
 
     curl_setopt_array($ch, [
         CURLOPT_URL => $proxyurl,
@@ -259,55 +271,78 @@ function douyin_proxy($proxyurl, $resolve)
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
-        CURLOPT_TIMEOUT => 300,
+        CURLOPT_TIMEOUT => 0,
         CURLOPT_CONNECTTIMEOUT => 10,
         // 防 DNS 重绑定：将校验过的域名固定到已验证的公网 IP
         CURLOPT_RESOLVE => ["{$resolve['host']}:{$resolve['port']}:{$resolve['ip']}"],
-        CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders) {
+        CURLOPT_HEADERFUNCTION => function ($curl, $header) use (&$responseHeaders, &$upstreamStatus) {
             $len = strlen($header);
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $header, $m)) {
+                $upstreamStatus = (int)$m[1];
+                // 跟随重定向时只保留最后一跳的响应头
+                $responseHeaders = [];
+                return $len;
+            }
             $headerParts = explode(':', $header, 2);
             if (count($headerParts) >= 2) {
-                $key = strtolower(trim($headerParts[0]));
-                $responseHeaders[$key] = trim($headerParts[1]);
+                $responseHeaders[strtolower(trim($headerParts[0]))] = trim($headerParts[1]);
             }
             return $len;
         },
-        CURLOPT_WRITEFUNCTION => function ($ch, $data) {
+        CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$responseHeaders, &$upstreamStatus, &$headersSent, $proxyurl) {
+            if (!$headersSent) {
+                send_douyin_video_headers($upstreamStatus, $responseHeaders, $proxyurl);
+                $headersSent = true;
+            }
             echo $data;
-            if (ob_get_length() > 0) ob_flush();
+            if (ob_get_length() > 0) {
+                ob_flush();
+            }
             flush();
             return strlen($data);
-        }
+        },
     ]);
-
-    $contentType = $responseHeaders['content-type'] ?? 'application/octet-stream';
-    if (ob_get_length() > 0) ob_clean();
-
-    $filename = 'douyin_' . md5($proxyurl) . '.mp4';
-    header('Content-Type: ' . $contentType);
-    header('Content-Disposition: attachment; filename="' . $filename . '"');
-    header('Content-Transfer-Encoding: binary');
-    header('Expires: 0');
-    header('Cache-Control: must-revalidate');
-    header('Pragma: public');
 
     curl_exec($ch);
     $curlErrno = curl_errno($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($curlErrno !== 0) {
-        $errorMsg = '视频传输失败: ' . curl_strerror($curlErrno);
-        error_log($errorMsg . ' URL: ' . $proxyurl);
-        echo "\n" . $errorMsg;
-    } elseif ($httpCode != 200) {
-        $errorMsg = '请求失败，HTTP状态码: ' . $httpCode;
-        if ($httpCode == 403) {
-            $errorMsg .= '（可能需要更新Cookie或Referer头信息）';
-        }
-        error_log($errorMsg . ' URL: ' . $proxyurl);
-        echo "\n" . $errorMsg;
+    // 上游没有响应体（403/404 等）：补发状态码，让前端能显示真实原因
+    if (!$headersSent) {
+        send_douyin_video_headers($upstreamStatus ?: $httpCode, $responseHeaders, $proxyurl);
     }
+
+    if ($curlErrno !== 0) {
+        error_log('视频传输失败: ' . curl_strerror($curlErrno) . ' URL: ' . $proxyurl);
+    } elseif ($httpCode === 403) {
+        error_log('上游 403（链接可能已过期或与请求 IP 绑定） URL: ' . $proxyurl);
+    }
+}
+
+/**
+ * 把上游状态与关键响应头转给客户端，支持 206 分段与 Content-Range
+ */
+function send_douyin_video_headers($status, array $headers, $proxyurl)
+{
+    $code = (int)$status;
+    if ($code < 200 || $code >= 600) {
+        $code = 200;
+    }
+    http_response_code($code);
+
+    header('Content-Type: ' . ($headers['content-type'] ?? 'video/mp4'));
+    if (!empty($headers['content-length'])) {
+        header('Content-Length: ' . $headers['content-length']);
+    }
+    if (!empty($headers['content-range'])) {
+        header('Content-Range: ' . $headers['content-range']);
+    }
+    header('Accept-Ranges: bytes');
+    $filename = 'douyin_' . md5($proxyurl) . '.mp4';
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Content-Transfer-Encoding: binary');
+    header('Cache-Control: no-store');
 }
 
 main();
