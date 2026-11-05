@@ -51,7 +51,7 @@ export default {
                 return jsonResponse(400, "请输入抖音链接");
             }
 
-            const result = await parseShareText(input);
+            const result = await parseShareText(input, getQualityPreference(request));
             return new Response(JSON.stringify(result), {
                 status: result.code >= 500 ? 500 : 200,
                 headers: CORS_HEADERS,
@@ -107,7 +107,16 @@ async function getInputUrl(request) {
     return "";
 }
 
-async function parseShareText(text) {
+// 清晰度偏好：quality=1080p / 1080 / h264 / original，variant=档位下标（0 起）
+function getQualityPreference(request) {
+    const params = new URL(request.url).searchParams;
+    const quality = (params.get("quality") || "").trim().toLowerCase();
+    const rawVariant = (params.get("variant") || "").trim();
+    const variant = /^\d+$/.test(rawVariant) ? Number(rawVariant) : null;
+    return {quality, variant};
+}
+
+async function parseShareText(text, prefs = {}) {
     const shareUrl = extractFirstUrl(text);
     if (!shareUrl) {
         return output(400, "未在文本中识别到有效链接");
@@ -135,7 +144,7 @@ async function parseShareText(text) {
         return output(500, detailResult.reason ? `请求失败（${detailResult.reason}）` : "请求失败", data);
     }
 
-    const payload = await buildLegacyFormatData(detailResult.detail.aweme_detail, awemeId);
+    const payload = await buildLegacyFormatData(detailResult.detail.aweme_detail, awemeId, prefs);
     const ok =
         (payload.type === "video" && payload.url) ||
         ((payload.type === "image" || payload.type === "live") &&
@@ -412,7 +421,7 @@ async function fetchAwemeDetail(awemeId) {
     }
 }
 
-async function buildLegacyFormatData(detail, fallbackVideoId) {
+async function buildLegacyFormatData(detail, fallbackVideoId, prefs = {}) {
     const title = stringValue(detail?.desc);
 
     const authorArr = isObject(detail?.author) ? detail.author : {};
@@ -519,7 +528,7 @@ async function buildLegacyFormatData(detail, fallbackVideoId) {
         }
     } else {
         result.type = "video";
-        const videoInfo = await extractHighestQualityVideo(detail);
+        const videoInfo = await extractHighestQualityVideo(detail, prefs);
 
         const playUri = extractVidFromVideoInfo(video);
         let main = videoInfo.url;
@@ -962,7 +971,7 @@ function formatVariantOutput(variant) {
     };
 }
 
-async function extractHighestQualityVideo(detail) {
+async function extractHighestQualityVideo(detail, prefs = {}) {
     const video = isObject(detail?.video) ? detail.video : {};
     let variants = await extractVideoVariants(video);
 
@@ -1006,13 +1015,15 @@ async function extractHighestQualityVideo(detail) {
     variants = dedupeVideoVariants(variants);
     sortVideoVariants(variants);
 
-    const best = variants[0];
+    // 按调用方偏好选档：variant 下标优先，其次 quality 标签/高度/编码匹配
+    const selectedIndex = selectVariantIndex(variants, prefs);
+    const best = variants[selectedIndex];
     const backup = [];
     const variantOutput = [];
 
     variants.forEach((variant, index) => {
         variant.url = ensureVideoMimeType(variant.url);
-        if (index > 0 && variant.url && !backup.includes(variant.url)) {
+        if (index !== selectedIndex && variant.url && !backup.includes(variant.url)) {
             backup.push(variant.url);
         }
     });
@@ -1026,10 +1037,109 @@ async function extractHighestQualityVideo(detail) {
         backup,
         gearName: best.gear_name || "",
         variants: variantOutput,
+        selected_index: selectedIndex,
         is_original: Boolean(best.is_original),
         label: variantLabel(best),
         size: Number(best.size) || 0,
     };
+}
+
+// 选出输出档位下标；匹配不上时回退到排序后的第一档（最高画质）
+function selectVariantIndex(variants, prefs = {}) {
+    if (!variants.length) {
+        return 0;
+    }
+
+    const variantIndex = Number.isInteger(prefs.variant) ? prefs.variant : null;
+    if (variantIndex !== null) {
+        return variants[variantIndex] ? variantIndex : 0;
+    }
+
+    const quality = String(prefs.quality || "").trim().toLowerCase();
+    if (!quality || quality === "auto" || quality === "best" || quality === "highest") {
+        return 0;
+    }
+
+    const parts = quality.split(/[-_/\s]+/).filter(Boolean);
+
+    for (let index = 0; index < variants.length; index++) {
+        if (variantMatchesPreference(variants[index], quality, parts)) {
+            return index;
+        }
+    }
+
+    // 纯数字但没精确命中时，取不超过请求高度的最高一档
+    if (/^\d+$/.test(quality)) {
+        const want = Number(quality);
+        let fallback = null;
+        variants.forEach((item, index) => {
+            const height = Number(item.height) || 0;
+            if (height > 0 && height <= want) {
+                if (fallback === null || height > (Number(variants[fallback].height) || 0)) {
+                    fallback = index;
+                }
+            }
+        });
+        if (fallback !== null) {
+            return fallback;
+        }
+    }
+
+    return 0;
+}
+
+function variantMatchesPreference(variant, quality, parts) {
+    // 原始档位没有 label 字段，用 variantLabel 现算，保证 1080p / 2160p 这类写法可命中
+    const label = String(variant.label || variantLabel(variant)).trim().toLowerCase();
+    const gear = String(variant.gear_name || "").trim().toLowerCase();
+    const codec = String(variant.codec || "").trim().toLowerCase();
+    const height = Number(variant.height) || 0;
+    const isOriginal = Boolean(variant.is_original);
+
+    if (quality === "original" || quality === "raw") {
+        return isOriginal;
+    }
+    if (quality === label || (gear && quality === gear)) {
+        return true;
+    }
+    if (/^\d+$/.test(quality)) {
+        return height === Number(quality);
+    }
+    const heightMatch = quality.match(/^(\d{3,4})p$/);
+    if (heightMatch) {
+        return height === Number(heightMatch[1]);
+    }
+
+    for (const part of parts) {
+        if (!part) {
+            continue;
+        }
+        if (part === "original" || part === "raw") {
+            if (isOriginal) {
+                continue;
+            }
+            return false;
+        }
+        if (part === codec) {
+            continue;
+        }
+        if (/^\d+$/.test(part)) {
+            if (Number(part) === height) {
+                continue;
+            }
+            return false;
+        }
+        const partHeight = part.match(/^(\d{3,4})p$/);
+        if (partHeight && Number(partHeight[1]) === height) {
+            continue;
+        }
+        if (label.indexOf(part) === 0 || (gear && gear.indexOf(part) === 0)) {
+            continue;
+        }
+        return false;
+    }
+
+    return true;
 }
 
 // 统一响应契约辅助：1024 进制 B/KB/MB/GB/TB，最多两位小数且不保留尾部 0

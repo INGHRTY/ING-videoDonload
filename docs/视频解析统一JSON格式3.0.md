@@ -186,6 +186,17 @@
 }
 ```
 
+### 请求参数：选择清晰度（可选）
+
+抖音接口支持两个可选参数，把指定档位作为主地址输出；都不传时输出排序后的最高画质：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `quality` | string | 档位标签（`2160p` / `1080p`）、真实高度（`1080`）、编码（`h264` / `h265`）或 `original`，可用 `-` 组合（如 `1080p-h264`）；匹配不到时回退到最高画质 |
+| `variant` | integer | `data.video_variants` 的下标（0 起），优先级高于 `quality` |
+
+参数建议放在 `url` 之前（`?quality=720p&url=...`），聚合入口 `sv.php` 会自动透传。选中档位会写入 `data.url` / `data.quality` / `data.size`，`data.video_variants` 仍返回完整档位表。
+
 ### video_backup 与 video_variants
 
 `video_backup` 是可选字符串数组，按主地址的排序规则给出其余档位的直链，便于兼容旧客户端。

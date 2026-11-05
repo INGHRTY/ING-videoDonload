@@ -181,6 +181,30 @@ curl "https://api.bugpk.com/api/douyin/douyin.php?url=https://v.douyin.com/xxxx/
 > 抖音接口支持直接粘贴带文案的分享文本，例如：
 > `?url=7.79 复制打开抖音... https://v.douyin.com/xxxx/ 看看这个`
 
+### 选择清晰度（可选）
+
+默认返回排序后的最高画质；需要指定档位时追加 `quality` 或 `variant`，并把它们放在 `url` **之前**：
+
+```bash
+# 按标签 / 真实高度 / 编码选档
+curl "https://你的服务器地址/api/douyin/douyin.php?quality=720p&url=https://v.douyin.com/xxxx/"
+curl "https://你的服务器地址/api/douyin/douyin.php?quality=1080&url=https://v.douyin.com/xxxx/"
+curl "https://你的服务器地址/api/douyin/douyin.php?quality=1080p-h264&url=https://v.douyin.com/xxxx/"
+curl "https://你的服务器地址/api/douyin/douyin.php?quality=original&url=https://v.douyin.com/xxxx/"
+
+# 按下标选档（对应 data.video_variants 的顺序，0 为最高画质）
+curl "https://你的服务器地址/api/douyin/douyin.php?variant=2&url=https://v.douyin.com/xxxx/"
+```
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `quality` | `2160p` / `1080` / `720p` / `h264` / `h265` / `original` | 支持档位标签、真实高度、编码，可用 `-` 组合（如 `1080p-h264`）；匹配不到时回退到最高画质 |
+| `variant` | `0` ~ `n-1` | `data.video_variants` 的下标，优先级高于 `quality` |
+
+- 选中的档位会填入 `data.url` / `data.quality` / `data.size`，完整档位表仍原样返回在 `data.video_variants`；
+- `response` 中 `code` 仍为 200，档位匹配不上不会报错，只是回退到最高画质；
+- 聚合入口 `api/sv.php` 会把 `quality` / `variant` 透传给对应平台接口。
+
 ### 聚合解析（自动分发）
 
 不想区分平台时，使用聚合入口 `api/sv.php`，自动识别平台并转发到对应单平台接口：

@@ -20,7 +20,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $fullUrl = $_SERVER['REQUEST_URI'];
     $urlParamPos = strpos($fullUrl, 'url=');
     if ($urlParamPos !== false) {
-        $url = urldecode(substr($fullUrl, $urlParamPos + 4));
+        $rawUrl = substr($fullUrl, $urlParamPos + 4);
+        // url= 之后若还跟了 quality=/variant=，先剥掉这些尾部参数再还原链接
+        $rawUrl = preg_replace('/(?:[?&](?:quality|variant|codec)=[^&]*)+$/i', '', $rawUrl);
+        $url = urldecode($rawUrl);
     }
 } else {
     $url = $_POST['url'] ?? null;
@@ -30,5 +33,18 @@ if (!$url && isset($_GET['url'])) {
     $url = $_GET['url'];
 }
 
+// 清晰度选择：quality=1080p / h264 / original，或 variant=2（档位下标）；
+// 都不传时输出排序后的最高画质，保持旧行为。
+$quality = '';
+$variant = null;
+foreach ([$_GET, $_POST] as $source) {
+    if ($quality === '' && isset($source['quality']) && is_scalar($source['quality'])) {
+        $quality = trim((string)$source['quality']);
+    }
+    if ($variant === null && isset($source['variant']) && is_scalar($source['variant']) && $source['variant'] !== '') {
+        $variant = is_numeric($source['variant']) ? (int)$source['variant'] : null;
+    }
+}
+
 $parser = new DouyinParser();
-echo $parser->parse($url);
+echo $parser->parse($url, ['quality' => $quality, 'variant' => $variant]);
